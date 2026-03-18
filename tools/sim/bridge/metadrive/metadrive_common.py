@@ -31,5 +31,5 @@ class RGBCameraRoad(CopyRamRGBCamera):
   def __init__(self, *args, **kwargs):
     super().__init__(*args, **kwargs)
     lens = self.get_lens()
-    lens.setFov(40)
+    lens.setFov(50)
     lens.setNear(0.1)

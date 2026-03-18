@@ -68,7 +68,7 @@ def metadrive_process(dual_camera: bool, config: dict, camera_array, wide_camera
 
   def reset():
     env.reset()
-    env.vehicle.config["max_speed_km_h"] = 1000
+    env.vehicle.config["max_speed_km_h"] = 30
     lane_idx_prev, _ = get_current_lane_info(env.vehicle)
 
     simulation_state = metadrive_simulation_state(
@@ -95,7 +95,7 @@ def metadrive_process(dual_camera: bool, config: dict, camera_array, wide_camera
 
   rk = Ratekeeper(100, None)
 
-  steer_ratio = 8
+  steer_ratio = 12
   vc = [0,0]
 
   while not exit_event.is_set():
