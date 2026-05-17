@@ -1,8 +1,42 @@
 #!/usr/bin/env python3
 import math
 import numpy as np
+import os
+import time
 from collections import deque
 from typing import Any
+
+_FAKE_LEAD_FILE = "/tmp/fake_lead"
+_FAKE_LEAD_CLEAR = "CLEAR"   # token que suprime cualquier lead (real o de visión)
+
+
+def _read_fake_lead() -> tuple[float, float, float] | None | str:
+  """
+  Lee /tmp/fake_lead. Soporta tres formatos:
+    "CLEAR"                                 → suprimir lead (devuelve "CLEAR")
+    2 valores: "dist_m  speed_ms"           (obstáculo estático, yRel=0)
+    3 valores: "d_rel  y_rel  v_npc_fwd"    (NPC rotonda, valores físicos reales)
+  Devuelve "CLEAR", (d_rel_m, y_rel_m, v_lead_ms) o None si el fichero es >1s de antiguo.
+  """
+  try:
+    if time.time() - os.path.getmtime(_FAKE_LEAD_FILE) > 1.0:
+      return None
+    content = open(_FAKE_LEAD_FILE).read().strip()
+    if content == _FAKE_LEAD_CLEAR:
+      return _FAKE_LEAD_CLEAR
+    parts = content.split()
+    d_rel = float(parts[0])
+    if len(parts) >= 3:
+      # Formato NPC rotonda: "d_rel  y_rel  v_npc_fwd"
+      y_rel  = float(parts[1])
+      v_lead = float(parts[2])
+    else:
+      # Formato obstáculo estático: "dist_m  speed_ms"
+      y_rel  = 0.0
+      v_lead = float(parts[1])
+    return d_rel, y_rel, v_lead
+  except Exception:
+    return None
 
 import capnp
 from cereal import messaging, log, car
@@ -244,6 +278,27 @@ class RadarD:
 
   def publish(self, pm: messaging.PubMaster):
     assert self.radar_state is not None
+
+    fake = _read_fake_lead()
+    if fake == _FAKE_LEAD_CLEAR:
+      # NPC acaba de cruzar: suprimir cualquier lead (incluyendo detecciones de visión)
+      # para que el ACC reanude la marcha inmediatamente sin seguir al NPC que se aleja.
+      self.radar_state.leadOne.status = False
+      self.radar_state.leadTwo.status = False
+    elif fake is not None:
+      d_rel, y_rel, v_npc_fwd = fake
+      lead = self.radar_state.leadOne
+      lead.status    = True
+      lead.dRel      = float(d_rel)
+      lead.yRel      = float(y_rel)
+      lead.vRel      = float(v_npc_fwd - self.v_ego)   # velocidad relativa longitudinal real
+      lead.vLead     = float(max(0.0, v_npc_fwd))       # velocidad absoluta del lead (≥0)
+      lead.vLeadK    = float(max(0.0, v_npc_fwd))
+      lead.aLeadK    = 0.0
+      lead.aLeadTau  = _LEAD_ACCEL_TAU
+      lead.modelProb = 1.0
+      lead.radar     = False
+      self.radar_state.leadTwo.status = False
 
     radar_msg = messaging.new_message("radarState")
     radar_msg.valid = self.radar_state_valid

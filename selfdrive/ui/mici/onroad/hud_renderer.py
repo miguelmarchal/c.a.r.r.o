@@ -1,6 +1,10 @@
+import threading
+import time
 import pyray as rl
 from dataclasses import dataclass
+import paho.mqtt.client as mqtt_lib
 from openpilot.common.constants import CV
+from openpilot.common.swaglog import cloudlog
 from openpilot.selfdrive.ui.mici.onroad.torque_bar import TorqueBar
 from openpilot.selfdrive.ui.ui_state import ui_state, UIStatus
 from openpilot.system.ui.lib.application import gui_app, FontWeight
@@ -11,6 +15,73 @@ from openpilot.common.filter_simple import FirstOrderFilter
 from cereal import log
 
 EventName = log.OnroadEvent.EventName
+
+# ── MQTT ext_rec ─────────────────────────────────────────────────────────
+_MQTT_BROKER    = 'broker.hivemq.com'
+_MQTT_PORT      = 1883
+_MQTT_TOPIC     = 'openpilot/mmarc2026/ext_recommendation'
+_MQTT_KEEPALIVE = 60
+
+_mqtt_lock  = threading.Lock()
+_mqtt_value = 1
+
+def _on_mqtt_connect(client, userdata, connect_flags, reason_code, properties):
+  if not reason_code.is_failure:
+    client.subscribe(_MQTT_TOPIC)
+    txt = f"[MQTT/MiciUI] Conectado a {_MQTT_BROKER} — '{_MQTT_TOPIC}'"
+    print(txt, flush=True)
+    cloudlog.info(txt)
+  else:
+    txt = f"[MQTT/MiciUI] Error conexion: {reason_code}"
+    print(txt, flush=True)
+    cloudlog.warning(txt)
+
+def _on_mqtt_message(client, userdata, msg):
+  global _mqtt_value
+  try:
+    val = int(msg.payload.decode().strip())
+    if val in (0, 1):
+      with _mqtt_lock:
+        _mqtt_value = val
+      try:
+        with open('/tmp/ext_recommendation', 'w') as f:
+          f.write(str(val))
+      except Exception:
+        pass
+      txt = f"[MQTT/MiciUI] ext_rec={val} ({'PELIGRO' if val == 0 else 'LIBRE'})"
+      print(txt, flush=True)
+  except Exception:
+    pass
+
+def _on_mqtt_disconnect(client, userdata, disconnect_flags, reason_code, properties):
+  txt = "[MQTT/MiciUI] Desconectado — reconectando..."
+  print(txt, flush=True)
+  cloudlog.warning(txt)
+
+def _start_mqtt_client():
+  client = mqtt_lib.Client(mqtt_lib.CallbackAPIVersion.VERSION2)
+  client.on_connect    = _on_mqtt_connect
+  client.on_message    = _on_mqtt_message
+  client.on_disconnect = _on_mqtt_disconnect
+  client.reconnect_delay_set(min_delay=2, max_delay=30)
+
+  def _run():
+    print(f"[MQTT/MiciUI] Iniciando conexion a {_MQTT_BROKER}:{_MQTT_PORT} ...", flush=True)
+    while True:
+      try:
+        client.connect(_MQTT_BROKER, _MQTT_PORT, _MQTT_KEEPALIVE)
+        client.loop_forever()
+      except Exception as e:
+        txt = f"[MQTT/MiciUI] Conexion fallida: {e} — reintentando en 5 s"
+        print(txt, flush=True)
+        cloudlog.warning(txt)
+        time.sleep(5)
+
+  threading.Thread(target=_run, daemon=True, name="mqtt-mici-ui").start()
+  return client
+
+_mqtt_client = _start_mqtt_client()
+# ─────────────────────────────────────────────────────────────────────────
 
 # Constants
 SET_SPEED_NA = 255
@@ -126,6 +197,7 @@ class HudRenderer(Widget):
     self._wheel_y_filter = FirstOrderFilter(0, 0.1, 1 / gui_app.target_fps)
 
     self._set_speed_alpha_filter = FirstOrderFilter(0.0, 0.1, 1 / gui_app.target_fps)
+    self.ext_rec: int = 1  # 1 = libre, 0 = peligro
 
   def set_wheel_critical_icon(self, critical: bool):
     """Set the wheel icon to critical or normal state."""
@@ -141,6 +213,12 @@ class HudRenderer(Widget):
 
   def _update_state(self) -> None:
     """Update HUD state based on car state and controls state."""
+    try:
+      with open('/tmp/ext_recommendation') as f:
+        self.ext_rec = int(f.read().strip())
+    except Exception:
+      self.ext_rec = 1
+
     sm = ui_state.sm
     if sm.recv_frame["carState"] < ui_state.started_frame:
       self.is_cruise_set = False
@@ -178,6 +256,28 @@ class HudRenderer(Widget):
       self._draw_set_speed(rect)
 
     self._draw_steering_wheel(rect)
+    self._draw_ext_rec(rect)
+
+  def _draw_ext_rec(self, rect: rl.Rectangle) -> None:
+    is_safe   = self.ext_rec == 1
+    label_col = rl.Color(128, 216, 166, 255) if is_safe else rl.Color(220, 60, 60, 255)
+    value_col = rl.WHITE if is_safe else rl.Color(255, 110, 110, 255)
+    border_col = rl.Color(label_col.r, label_col.g, label_col.b, 120)
+
+    w, h = 240, 130
+    x = int(rect.x + rect.width - w - 20)
+    y = int(rect.y)
+    box = rl.Rectangle(x, y, w, h)
+    rl.draw_rectangle_rounded(box, 0.35, 10, rl.Color(0, 0, 0, 166))
+    rl.draw_rectangle_rounded_lines_ex(box, 0.35, 10, 5, border_col)
+
+    label = "ALG"
+    lw = measure_text_cached(self._font_semi_bold, label, 34).x
+    rl.draw_text_ex(self._font_semi_bold, label, rl.Vector2(x + (w - lw) / 2, y + 14), 34, 0, label_col)
+
+    value = "Libre" if is_safe else "Frenando"
+    vw = measure_text_cached(self._font_bold, value, 50).x
+    rl.draw_text_ex(self._font_bold, value, rl.Vector2(x + (w - vw) / 2, y + 62), 50, 0, value_col)
 
   def _draw_steering_wheel(self, rect: rl.Rectangle) -> None:
     wheel_txt = self._txt_wheel_critical if self._show_wheel_critical else self._txt_wheel

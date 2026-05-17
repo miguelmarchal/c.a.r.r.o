@@ -4,11 +4,14 @@ from openpilot.common.params import Params
 from openpilot.common.realtime import Priority, config_realtime_process
 from openpilot.common.swaglog import cloudlog
 from openpilot.selfdrive.controls.lib.ldw import LaneDepartureWarning
-from openpilot.selfdrive.controls.lib.longitudinal_planner import LongitudinalPlanner
+from openpilot.selfdrive.controls.lib.longitudinal_planner import LongitudinalPlanner, mqtt_start
 import cereal.messaging as messaging
 
 
 def main():
+  print("[plannerd] Arrancando MQTT antes de cualquier otra cosa...", flush=True)
+  mqtt_start()
+
   config_realtime_process(5, Priority.CTRL_LOW)
 
   cloudlog.info("plannerd is waiting for CarParams")
@@ -19,7 +22,7 @@ def main():
   ldw = LaneDepartureWarning()
   longitudinal_planner = LongitudinalPlanner(CP)
   pm = messaging.PubMaster(['longitudinalPlan', 'driverAssistance'])
-  sm = messaging.SubMaster(['carControl', 'carState', 'controlsState', 'liveParameters', 'radarState', 'modelV2', 'selfdriveState'],
+  sm = messaging.SubMaster(['carControl', 'carState', 'controlsState', 'liveParameters', 'radarState', 'modelV2', 'selfdriveState', 'gpsLocationExternal'],
                            poll='modelV2')
 
   while True:

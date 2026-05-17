@@ -1,12 +1,83 @@
+import threading
+import time
 import pyray as rl
 from dataclasses import dataclass
+import paho.mqtt.client as mqtt_lib
 from openpilot.common.constants import CV
+from openpilot.common.swaglog import cloudlog
 from openpilot.selfdrive.ui.onroad.exp_button import ExpButton
 from openpilot.selfdrive.ui.ui_state import ui_state, UIStatus
 from openpilot.system.ui.lib.application import gui_app, FontWeight
 from openpilot.system.ui.lib.multilang import tr
 from openpilot.system.ui.lib.text_measure import measure_text_cached
 from openpilot.system.ui.widgets import Widget
+
+# ── MQTT — misma config que longitudinal_planner ────────────────────────
+_MQTT_BROKER    = 'broker.hivemq.com'
+_MQTT_PORT      = 1883
+_MQTT_TOPIC     = 'openpilot/mmarc2026/ext_recommendation'
+_MQTT_KEEPALIVE = 60
+
+_mqtt_lock  = threading.Lock()
+_mqtt_value = 1   # default: libre
+
+def _on_mqtt_connect(client, userdata, connect_flags, reason_code, properties):
+  if not reason_code.is_failure:
+    client.subscribe(_MQTT_TOPIC)
+    txt = f"[MQTT/UI] Conectado a {_MQTT_BROKER} — '{_MQTT_TOPIC}'"
+    print(txt, flush=True)
+    cloudlog.info(txt)
+  else:
+    txt = f"[MQTT/UI] Error conexion: {reason_code}"
+    print(txt, flush=True)
+    cloudlog.warning(txt)
+
+def _on_mqtt_message(client, userdata, msg):
+  global _mqtt_value
+  try:
+    val = int(msg.payload.decode().strip())
+    if val in (0, 1):
+      with _mqtt_lock:
+        _mqtt_value = val
+      try:
+        with open('/tmp/ext_recommendation', 'w') as f:
+          f.write(str(val))
+      except Exception:
+        pass
+      txt = f"[MQTT/UI] ext_rec={val} ({'PELIGRO' if val == 0 else 'LIBRE'})"
+      print(txt, flush=True)
+  except Exception:
+    pass
+
+def _on_mqtt_disconnect(client, userdata, disconnect_flags, reason_code, properties):
+  txt = "[MQTT/UI] Desconectado — reconectando..."
+  print(txt, flush=True)
+  cloudlog.warning(txt)
+
+def _start_mqtt_client():
+  client = mqtt_lib.Client(mqtt_lib.CallbackAPIVersion.VERSION2)
+  client.on_connect    = _on_mqtt_connect
+  client.on_message    = _on_mqtt_message
+  client.on_disconnect = _on_mqtt_disconnect
+  client.reconnect_delay_set(min_delay=2, max_delay=30)
+
+  def _run():
+    print(f"[MQTT/UI] Iniciando conexion a {_MQTT_BROKER}:{_MQTT_PORT} ...", flush=True)
+    while True:
+      try:
+        client.connect(_MQTT_BROKER, _MQTT_PORT, _MQTT_KEEPALIVE)
+        client.loop_forever()
+      except Exception as e:
+        txt = f"[MQTT/UI] Conexion fallida: {e} — reintentando en 5 s"
+        print(txt, flush=True)
+        cloudlog.warning(txt)
+        time.sleep(5)
+
+  threading.Thread(target=_run, daemon=True, name="mqtt-ui").start()
+  return client
+
+_mqtt_client = _start_mqtt_client()
+# ────────────────────────────────────────────────────────────────────────
 
 # Constants
 SET_SPEED_NA = 255
@@ -23,6 +94,8 @@ class UIConfig:
   set_speed_width_imperial: int = 172
   set_speed_height: int = 204
   wheel_icon_size: int = 144
+  ext_rec_width: int = 300
+  ext_rec_height: int = 165
 
 
 @dataclass(frozen=True)
@@ -31,6 +104,8 @@ class FontSizes:
   speed_unit: int = 66
   max_speed: int = 40
   set_speed: int = 90
+  ext_rec_label: int = 38
+  ext_rec_value: int = 58
 
 
 @dataclass(frozen=True)
@@ -49,6 +124,9 @@ class Colors:
   BORDER_TRANSLUCENT = rl.Color(255, 255, 255, 75)
   HEADER_GRADIENT_START = rl.Color(0, 0, 0, 114)
   HEADER_GRADIENT_END = rl.BLANK
+  EXT_REC_SAFE = rl.Color(128, 216, 166, 255)    # verde: libre
+  EXT_REC_DANGER = rl.Color(220, 60, 60, 255)    # rojo: peligro
+  EXT_REC_DANGER_TEXT = rl.Color(255, 110, 110, 255)
 
 
 UI_CONFIG = UIConfig()
@@ -71,9 +149,16 @@ class HudRenderer(Widget):
     self._font_medium: rl.Font = gui_app.font(FontWeight.MEDIUM)
 
     self._exp_button: ExpButton = ExpButton(UI_CONFIG.button_size, UI_CONFIG.wheel_icon_size)
+    self.ext_rec: int = 1  # 1 = libre (safe), 0 = peligro (danger)
 
   def _update_state(self) -> None:
     """Update HUD state based on car state and controls state."""
+    try:
+      with open('/tmp/ext_recommendation') as f:
+        self.ext_rec = int(f.read().strip())
+    except Exception:
+      self.ext_rec = 1
+
     sm = ui_state.sm
     if sm.recv_frame["carState"] < ui_state.started_frame:
       self.is_cruise_set = False
@@ -112,6 +197,8 @@ class HudRenderer(Widget):
       COLORS.HEADER_GRADIENT_END,
     )
 
+    self._draw_ext_rec(rect)
+
     if self.is_cruise_available:
       self._draw_set_speed(rect)
 
@@ -123,6 +210,44 @@ class HudRenderer(Widget):
 
   def user_interacting(self) -> bool:
     return self._exp_button.is_pressed
+
+  def _draw_ext_rec(self, rect: rl.Rectangle) -> None:
+    """Draw the external recommendation indicator (top-right, left of the exp button)."""
+    w = UI_CONFIG.ext_rec_width
+    h = UI_CONFIG.ext_rec_height
+    x = rect.x + rect.width - UI_CONFIG.border_size - UI_CONFIG.button_size - 30 - w
+    y = rect.y + 45
+
+    is_safe = self.ext_rec == 1
+    label_color = COLORS.EXT_REC_SAFE if is_safe else COLORS.EXT_REC_DANGER
+    value_color = COLORS.WHITE if is_safe else COLORS.EXT_REC_DANGER_TEXT
+    border_color = rl.Color(int(label_color.r), int(label_color.g), int(label_color.b), 120)
+
+    box_rect = rl.Rectangle(x, y, w, h)
+    rl.draw_rectangle_rounded(box_rect, 0.35, 10, COLORS.BLACK_TRANSLUCENT)
+    rl.draw_rectangle_rounded_lines_ex(box_rect, 0.35, 10, 6, border_color)
+
+    label = "ALG"
+    label_w = measure_text_cached(self._font_semi_bold, label, FONT_SIZES.ext_rec_label).x
+    rl.draw_text_ex(
+      self._font_semi_bold,
+      label,
+      rl.Vector2(x + (w - label_w) / 2, y + 18),
+      FONT_SIZES.ext_rec_label,
+      0,
+      label_color,
+    )
+
+    value = "Libre" if is_safe else "Frenando"
+    value_w = measure_text_cached(self._font_bold, value, FONT_SIZES.ext_rec_value).x
+    rl.draw_text_ex(
+      self._font_bold,
+      value,
+      rl.Vector2(x + (w - value_w) / 2, y + 72),
+      FONT_SIZES.ext_rec_value,
+      0,
+      value_color,
+    )
 
   def _draw_set_speed(self, rect: rl.Rectangle) -> None:
     """Draw the MAX speed indicator box."""

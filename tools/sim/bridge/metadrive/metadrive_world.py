@@ -7,11 +7,14 @@ import math
 
 from multiprocessing import Pipe, Array
 
+import cereal.messaging as messaging
 from openpilot.tools.sim.bridge.common import QueueMessage, QueueMessageType
 from openpilot.tools.sim.bridge.metadrive.metadrive_process import (metadrive_process, metadrive_simulation_state,
                                                                     metadrive_vehicle_state)
 from openpilot.tools.sim.lib.common import SimulatorState, World, vec3
 from openpilot.tools.sim.lib.camerad import W, H
+
+
 
 
 class MetaDriveWorld(World):
@@ -51,22 +54,47 @@ class MetaDriveWorld(World):
     print("---- Spawning Metadrive world, this might take awhile ----")
     print("----------------------------------------------------------")
 
-    self.vehicle_last_pos = self.vehicle_state_recv.recv().position # wait for a state message to ensure metadrive is launched
+    self.vehicle_last_pos = self.vehicle_state_recv.recv().position
     self.status_q.put(QueueMessage(QueueMessageType.START_STATUS, "started"))
 
+    # ── ORIGINAL sin tocar ───────────────────────────────────────
     self.steer_ratio = 15
-    self.vc = [0.0,0.0]
+    self.vc = [0.0, 0.0]
     self.reset_time = 0
     self.should_reset = False
 
+    self._radar_sm = messaging.SubMaster(['radarState', 'longitudinalPlan'])
+    self._lead_monitor_t = 0
+
+    # ── Estado del controlador geométrico (solo esto es nuevo) ───
+    self._nav_arrow = [0.0, 0.0, 0.0]
+    self._current_speed = 0.0
+    self._geo_steer = 0.0
+
+  def _compute_geometric_steer(self):
+    """
+    Devuelve ángulo de volante calculado desde nav_arrow,
+    o None si no hay curva activa (openpilot toma el steering).
+    nav_arrow[1] > 0 = derecha, < 0 = izquierda
+    """
+    lateral = self._nav_arrow[1] if len(self._nav_arrow) >= 2 else 0.0
+
+
   def apply_controls(self, steer_angle, throttle_out, brake_out):
     if (time.monotonic() - self.reset_time) > 2:
-      self.vc[0] = steer_angle
+      # Steering: geométrico en curva, openpilot en recta
+      geo = self._compute_geometric_steer()
+      self.vc[0] = geo if geo is not None else steer_angle
 
+      # Longitudinal: siempre openpilot ── no tocamos esto
       if throttle_out:
         self.vc[1] = throttle_out
       else:
         self.vc[1] = -brake_out
+
+      if geo is not None:
+        print(f"[GEO] nav={self._nav_arrow[1]:.2f} spd={self._current_speed:.1f} "
+              f"geo={geo:.1f}° op={steer_angle:.1f}°")
     else:
       self.vc[0] = 0
       self.vc[1] = 0
@@ -93,7 +121,7 @@ class MetaDriveWorld(World):
       state.gps.from_xy(curr_pos)
       state.valid = True
 
-      # Calcular giroscopio sintético a partir del cambio de bearing
+      # Calcular giroscopio sintético
       dt = 0.01  # 100Hz
       bearing_rad = math.radians(md_vehicle.bearing)
       prev_bearing_rad = math.radians(prev_bearing)
@@ -130,6 +158,27 @@ class MetaDriveWorld(World):
         self.last_check_timestamp = current_time
         self.distance_moved = 0
         self.vehicle_last_pos = curr_pos
+
+    self._log_lead(state)
+  def _log_lead(self, state: SimulatorState):
+    now = time.monotonic()
+    if now - self._lead_monitor_t < 0.5:   # 2 Hz es suficiente
+      return
+    self._lead_monitor_t = now
+
+    self._radar_sm.update(0)
+    lead = self._radar_sm['radarState'].leadOne
+    plan = self._radar_sm['longitudinalPlan']
+
+    if state.velocity is None:
+      return
+    v_ego_kph = math.sqrt(state.velocity.x**2 + state.velocity.y**2) * 3.6
+    if lead.status:
+      a_target = plan.aTarget if self._radar_sm.updated['longitudinalPlan'] else float('nan')
+      print(f"[LEAD] DETECTADO  dRel={lead.dRel:.1f}m  vLead={lead.vLead*3.6:.1f}km/h  "
+            f"ego={v_ego_kph:.1f}km/h  aTarget={a_target:.2f}m/s²")
+    else:
+      print(f"[LEAD] sin lead    ego={v_ego_kph:.1f}km/h")
 
   def read_cameras(self):
     pass

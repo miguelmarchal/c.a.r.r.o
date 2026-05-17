@@ -1,5 +1,4 @@
 import numpy as np
-
 from metadrive.component.sensors.rgb_camera import RGBCamera
 from panda3d.core import Texture, GraphicsOutput
 
